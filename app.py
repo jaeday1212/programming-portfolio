@@ -4,6 +4,8 @@ import plotly.graph_objects as go
 from dash import Dash, dcc, html, Input, Output
 import dash_bootstrap_components as dbc
 import os
+import time
+from functools import lru_cache
 from datetime import date
 
 CSV_PATH = "device_metrics.csv"
@@ -13,18 +15,33 @@ if not os.path.exists(CSV_PATH):
         f"Expected {CSV_PATH} not found. Run device_simulator.py first to generate initial history."
     )
 
-df = pd.read_csv(CSV_PATH)
-
+_initial_df = pd.read_csv(CSV_PATH)
 EXPECTED_COLS = {"date", "device_id", "temperature_c", "humidity_pct", "battery_pct", "error_count", "status"}
-missing = EXPECTED_COLS - set(df.columns)
+missing = EXPECTED_COLS - set(_initial_df.columns)
 if missing:
     raise ValueError(f"CSV missing expected columns: {missing}")
 
-df['date'] = pd.to_datetime(df['date'])
-df = df.sort_values(['device_id', 'date'])
+_initial_df['date'] = pd.to_datetime(_initial_df['date'])
+_initial_df = _initial_df.sort_values(['device_id', 'date'])
 
-DEVICE_IDS = sorted(df['device_id'].unique().tolist())
+DEVICE_IDS = sorted(_initial_df['device_id'].unique().tolist())
 DEFAULT_DEVICE = DEVICE_IDS[0]
+
+# Lightweight cache to avoid re-reading the CSV more than once per CACHE_TTL seconds
+CACHE_TTL = 30  # seconds
+
+@lru_cache(maxsize=1)
+def _cached_load(ts_bucket: int):  # ts_bucket changes every CACHE_TTL seconds
+    df = pd.read_csv(CSV_PATH)
+    # Basic schema guard (silent skip if already validated)
+    if EXPECTED_COLS - set(df.columns):
+        return _initial_df
+    df['date'] = pd.to_datetime(df['date'])
+    return df.sort_values(['device_id', 'date'])
+
+def load_dataframe():
+    ts_bucket = int(time.time() // CACHE_TTL)
+    return _cached_load(ts_bucket)
 METRICS = [
     {"label": "Temperature (C)", "value": "temperature_c"},
     {"label": "Humidity (%)", "value": "humidity_pct"},
@@ -113,6 +130,9 @@ app.index_string = """
             border-color: #16e0ffaa;
             box-shadow: var(--accent-glow), 0 10px 34px -8px #000;
         }
+        .kpi{background:linear-gradient(150deg,#0d1f33 0%,#07111f 70%);}
+        .kpi-label{font-size:.7rem; letter-spacing:1.5px; text-transform:uppercase; color:#7aaec2; font-weight:600;}
+        .kpi-value{font-size:1.9rem; font-weight:700; letter-spacing:1px; background:linear-gradient(90deg,#16e0ff,#ff00aa); -webkit-background-clip:text; color:transparent; filter:drop-shadow(0 0 6px #16e0ff55);}        
         .header-section {
             background: linear-gradient(120deg, #04101d 0%, #06263f 50%, #04101d 100%);
             padding: 36px 32px 42px;
@@ -214,12 +234,33 @@ app.index_string = """
 """
 app.layout = dbc.Container(
     [
+        dcc.Interval(id="auto-refresh", interval=60*1000, n_intervals=0),  # 60s refresh
         # ---------- HEADER ----------
         dbc.Row(
             dbc.Col(
                 html.Div(
                     [
             html.H1([
+                    # ---------- KPI SUMMARY CARDS ----------
+                    dbc.Row([
+                        dbc.Col(dbc.Card(dbc.CardBody([
+                            html.Div("Avg Temp (°C)", className="kpi-label"),
+                            html.Div(id="kpi-avg-temp", className="kpi-value")
+                        ]), className="card kpi"), xs=6, md=3, className="mb-3"),
+                        dbc.Col(dbc.Card(dbc.CardBody([
+                            html.Div("Avg Humidity (%)", className="kpi-label"),
+                            html.Div(id="kpi-avg-humidity", className="kpi-value")
+                        ]), className="card kpi"), xs=6, md=3, className="mb-3"),
+                        dbc.Col(dbc.Card(dbc.CardBody([
+                            html.Div("Avg Battery (%)", className="kpi-label"),
+                            html.Div(id="kpi-avg-battery", className="kpi-value")
+                        ]), className="card kpi"), xs=6, md=3, className="mb-3"),
+                        dbc.Col(dbc.Card(dbc.CardBody([
+                            html.Div("Errors (24h)", className="kpi-label"),
+                            html.Div(id="kpi-errors", className="kpi-value")
+                        ]), className="card kpi"), xs=6, md=3, className="mb-3"),
+                    ]),
+
                 html.Span(html.I(className="fas fa-microchip", style={
                     "marginRight":"14px",
                     "color":"#16e0ff",
@@ -341,9 +382,10 @@ app.layout = dbc.Container(
 # --------------------------------------------------
 @app.callback(
     Output("metric-timeseries", "figure"),
-    [Input("device-select", "value"), Input("metric-select", "value"), Input("status-filter", "value")]
+    [Input("device-select", "value"), Input("metric-select", "value"), Input("status-filter", "value"), Input("auto-refresh", "n_intervals")]
 )
-def update_metric_timeseries(device_id, metric, statuses):
+def update_metric_timeseries(device_id, metric, statuses, _n):
+    df = load_dataframe()
     device_df = df[df['device_id'] == device_id]
     device_df = device_df[device_df['status'].isin(statuses)]
     if device_df.empty:
@@ -378,9 +420,10 @@ def update_metric_timeseries(device_id, metric, statuses):
 
 @app.callback(
     Output("battery-overview", "figure"),
-    [Input("status-filter", "value")]
+    [Input("status-filter", "value"), Input("auto-refresh", "n_intervals")]
 )
-def update_battery_overview(statuses):
+def update_battery_overview(statuses, _n):
+    df = load_dataframe()
     # Get last record per device
     latest = df.sort_values(['device_id','date']).groupby('device_id').tail(1)
     # Ensure we include all known device ids (even if somehow missing data)
@@ -411,15 +454,37 @@ def update_battery_overview(statuses):
 
 @app.callback(
     Output("summary-text", "children"),
-    [Input("status-filter", "value")]
+    [Input("status-filter", "value"), Input("auto-refresh", "n_intervals")]
 )
-def update_summary(statuses):
+def update_summary(statuses, _n):
+    df = load_dataframe()
     latest = df.sort_values('date').groupby('device_id').tail(1)
     total = len(latest)
     counts = latest['status'].value_counts().to_dict()
     parts = [f"{k}:{counts.get(k,0)}" for k in STATUS_COLORS.keys() if k in statuses]
     last_date = df['date'].max().date().isoformat()
     return f"Devices: {total} • Status breakdown (filtered): {' | '.join(parts)} • Last update day in CSV: {last_date}"
+
+
+# KPI callbacks (combined for efficiency)
+@app.callback(
+    Output("kpi-avg-temp", "children"),
+    Output("kpi-avg-humidity", "children"),
+    Output("kpi-avg-battery", "children"),
+    Output("kpi-errors", "children"),
+    Input("auto-refresh", "n_intervals")
+)
+def update_kpis(_n):
+    df = load_dataframe()
+    if df.empty:
+        return "-", "-", "-", "-"
+    latest = df.sort_values('date').groupby('device_id').tail(1)
+    return (
+        f"{latest['temperature_c'].mean():.1f}",
+        f"{latest['humidity_pct'].mean():.1f}",
+        f"{latest['battery_pct'].mean():.1f}",
+        f"{int(latest['error_count'].sum())}"
+    )
 
 
 # --------------------------------------------------
